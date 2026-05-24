@@ -3,7 +3,8 @@ use hkdf::Hkdf;
 use ml_dsa::{KeyExport as _, Keypair as _, MlDsa65, Seed as MlDsaSeed, SigningKey, VerifyingKey};
 use sha3::{Digest, Sha3_256};
 
-pub type IdentitySeed = [u8; 64];
+pub type Bip39Seed = [u8; 64];
+pub type MasterSeed = Bip39Seed;
 
 // Domain Separation label format: resonance:<layer>:<object>:<purpose>:<algorithm>:<version>
 const IDENTITY_HKDF_SALT: &[u8] = b"resonance:identity:seed:hkdf-salt:hkdf-sha3-256:v1";
@@ -12,7 +13,7 @@ const IDENTITY_ID_LABEL: &[u8] = b"resonance:identity:public-key:id:sha3-256:v1"
 
 pub struct Identity {
     pub root_public_key: VerifyingKey<MlDsa65>,
-    pub(crate) root_secret_key: SigningKey<MlDsa65>,
+    root_secret_key: SigningKey<MlDsa65>,
     pub id: String,
 }
 
@@ -25,20 +26,23 @@ pub fn generate_mnemonic() -> Result<Mnemonic, bip39::Error> {
     Mnemonic::generate_in(Language::English, 24)
 }
 
-pub fn seed_from_mnemonic(mnemonic: &Mnemonic) -> IdentitySeed {
+pub fn seed_from_mnemonic(mnemonic: &Mnemonic) -> Bip39Seed {
     mnemonic.to_seed("")
 }
 
-pub(crate) fn derive_seed_material<const N: usize>(seed: &IdentitySeed, label: &[u8]) -> [u8; N] {
-    let hk = Hkdf::<Sha3_256>::new(Some(IDENTITY_HKDF_SALT), seed);
+pub(crate) fn derive_seed_material<const N: usize>(
+    master_seed: &MasterSeed,
+    label: &[u8],
+) -> [u8; N] {
+    let hk = Hkdf::<Sha3_256>::new(Some(IDENTITY_HKDF_SALT), master_seed);
     let mut output = [0u8; N];
     hk.expand(label, &mut output)
         .expect("HKDF output length must be at most 255 times the hash length");
     output
 }
 
-pub fn identity_from_seed(seed: &IdentitySeed) -> Identity {
-    let root_seed = derive_root_seed(seed);
+pub fn identity_from_seed(master_seed: &MasterSeed) -> Identity {
+    let root_seed = derive_root_seed(master_seed);
     let root_secret_key = SigningKey::<MlDsa65>::from_seed(&root_seed);
     let root_public_key = root_secret_key.verifying_key();
 
@@ -68,8 +72,8 @@ fn identity_id_from_public_key(public_key: &[u8]) -> String {
     format!("rsn:{}", hex::encode(short_hash))
 }
 
-fn derive_root_seed(seed: &IdentitySeed) -> MlDsaSeed {
-    let root_seed = derive_seed_material::<32>(seed, ROOT_ML_DSA_SEED_LABEL);
+fn derive_root_seed(master_seed: &MasterSeed) -> MlDsaSeed {
+    let root_seed = derive_seed_material::<32>(master_seed, ROOT_ML_DSA_SEED_LABEL);
     MlDsaSeed::try_from(&root_seed[..]).expect("root ML-DSA seed is always 32 bytes")
 }
 
