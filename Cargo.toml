@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bip39 = { version = "2.2", features = ["rand"] }
+hkdf = "0.12"
+hex = "0.4"
+ml-dsa = "0.1"
+sha3 = "0.10"
