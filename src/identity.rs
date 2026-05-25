@@ -6,6 +6,8 @@ use sha3::{Digest, Sha3_256};
 pub type Bip39Seed = [u8; 64];
 pub type MasterSeed = Bip39Seed;
 
+pub const IDENTITY_DERIVATION_VERSION: u32 = 1;
+
 // Domain Separation label format: resonance:<layer>:<object>:<purpose>:<algorithm>:<version>
 const IDENTITY_HKDF_SALT: &[u8] = b"resonance:identity:seed:hkdf-salt:hkdf-sha3-256:v1";
 const ROOT_ML_DSA_SEED_LABEL: &[u8] = b"resonance:identity:root-key:seed:ml-dsa-65:v1";
@@ -181,7 +183,10 @@ mod tests {
         let public = public_identity(&identity);
 
         assert_eq!(public.id, identity.id);
-        assert_eq!(public.root_public_key, identity.root_public_key.to_bytes().to_vec());
+        assert_eq!(
+            public.root_public_key,
+            identity.root_public_key.to_bytes().to_vec()
+        );
     }
 
     #[test]
@@ -196,7 +201,10 @@ mod tests {
         let expected_id = format!("rsn:{}", hex::encode(&expected_hash[..16]));
 
         assert_eq!(id, expected_id);
-        assert_ne!(id, format!("rsn:{}", hex::encode(&Sha3_256::digest(public_key)[..16])));
+        assert_ne!(
+            id,
+            format!("rsn:{}", hex::encode(&Sha3_256::digest(public_key)[..16]))
+        );
         assert_eq!(id.len(), 36);
         assert!(id.starts_with("rsn:"));
         assert!(id[4..].chars().all(|c| c.is_ascii_hexdigit()));
