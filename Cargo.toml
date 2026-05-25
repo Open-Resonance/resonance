@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+argon2 = "0.5"
 bip39 = { version = "2.2", features = ["rand"] }
+chacha20poly1305 = "0.10"
 hkdf = "0.12"
 hex = "0.4"
 ml-dsa = "0.1"
 sha3 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
