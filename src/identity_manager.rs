@@ -1,4 +1,5 @@
 
+// Manages Argon2id key derivation function  
 pub mod password_kdf {
     use argon2::{
         password_hash::rand_core::{OsRng, RngCore},
@@ -90,6 +91,7 @@ pub mod password_kdf {
     }
 }
 
+// Manages the creation, wrapping and unwrapping of the vault key
 pub mod vault_key {
     use super::password_kdf::PasswordKey;
     use argon2::password_hash::rand_core::{OsRng, RngCore};
@@ -184,11 +186,63 @@ pub mod vault_key {
     }
 }
 
+// Manages the encryption and decryption of the vault
+pub mod vault {
+    use super::vault_key::VaultKey;
+    use argon2::password_hash::rand_core::{OsRng, RngCore};
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit},
+        Key, XChaCha20Poly1305, XNonce,
+    };
+
+    const VAULT_NONCE_LEN: usize = 24;
+
+    pub struct VaultPlaintext {
+        pub data: Vec<u8>,
+    }
+
+    pub struct VaultCiphertext {
+        pub nonce: [u8; VAULT_NONCE_LEN],
+        pub ciphertext: Vec<u8>,
+    }
+
+    pub fn encrypt_vault(
+        plaintext: &VaultPlaintext,
+        vault_key: &VaultKey,
+    ) -> Result<VaultCiphertext, chacha20poly1305::Error> {
+        let mut nonce = [0u8; VAULT_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+
+        let cipher = cipher_from_vault_key(vault_key);
+        let ciphertext = cipher.encrypt(XNonce::from_slice(&nonce), plaintext.data.as_slice())?;
+
+        Ok(VaultCiphertext { nonce, ciphertext })
+    }
+
+    pub fn decrypt_vault(
+        ciphertext: &VaultCiphertext,
+        vault_key: &VaultKey,
+    ) -> Result<VaultPlaintext, chacha20poly1305::Error> {
+        let cipher = cipher_from_vault_key(vault_key);
+        let data = cipher.decrypt(
+            XNonce::from_slice(&ciphertext.nonce),
+            ciphertext.ciphertext.as_ref(),
+        )?;
+
+        Ok(VaultPlaintext { data })
+    }
+
+    fn cipher_from_vault_key(vault_key: &VaultKey) -> XChaCha20Poly1305 {
+        XChaCha20Poly1305::new(Key::from_slice(vault_key.as_bytes()))
+    }
+}
+
+
 
 
 #[cfg(test)]
 mod tests {
-    use super::{password_kdf, vault_key};
+    use super::{password_kdf, vault, vault_key};
 
     #[test]
     fn recreate_password_key_recreates_the_same_key() {
@@ -253,5 +307,52 @@ mod tests {
         };
 
         assert!(matches!(err, vault_key::VaultKeyError::Aead(_)));
+    }
+
+    #[test]
+    fn vault_encrypts_and_decrypts_plaintext() {
+        let vault_key = vault_key::create_vault_key();
+        let plaintext = vault::VaultPlaintext {
+            data: b"master seed and identity metadata eventually go here".to_vec(),
+        };
+
+        let ciphertext =
+            vault::encrypt_vault(&plaintext, &vault_key).expect("vault should encrypt");
+        let decrypted =
+            vault::decrypt_vault(&ciphertext, &vault_key).expect("vault should decrypt");
+
+        assert_eq!(decrypted.data, plaintext.data);
+        assert_ne!(ciphertext.nonce, [0u8; 24]);
+        assert_ne!(ciphertext.ciphertext, plaintext.data);
+    }
+
+    #[test]
+    fn vault_decryption_rejects_wrong_vault_key() {
+        let vault_key = vault_key::create_vault_key();
+        let wrong_vault_key = vault_key::create_vault_key();
+        let plaintext = vault::VaultPlaintext {
+            data: b"vault plaintext".to_vec(),
+        };
+        let ciphertext =
+            vault::encrypt_vault(&plaintext, &vault_key).expect("vault should encrypt");
+
+        let result = vault::decrypt_vault(&ciphertext, &wrong_vault_key);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn vault_decryption_rejects_tampered_ciphertext() {
+        let vault_key = vault_key::create_vault_key();
+        let plaintext = vault::VaultPlaintext {
+            data: b"vault plaintext".to_vec(),
+        };
+        let mut ciphertext =
+            vault::encrypt_vault(&plaintext, &vault_key).expect("vault should encrypt");
+        ciphertext.ciphertext[0] ^= 1;
+
+        let result = vault::decrypt_vault(&ciphertext, &vault_key);
+
+        assert!(result.is_err());
     }
 }
