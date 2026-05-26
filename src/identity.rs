@@ -2,10 +2,11 @@ use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
 use ml_dsa::{KeyExport as _, Keypair as _, MlDsa65, Seed as MlDsaSeed, SigningKey, VerifyingKey};
 use sha3::{Digest, Sha3_256};
+use zeroize::Zeroize;
 
 pub type Bip39Seed = [u8; 64];
 pub type MasterSeed = Bip39Seed;
-pub type LocalStorageKey = [u8; 32];
+pub type LocalStorageWrappingKey = [u8; 32];
 
 pub const IDENTITY_DERIVATION_VERSION: u32 = 1;
 
@@ -13,12 +14,12 @@ pub const IDENTITY_DERIVATION_VERSION: u32 = 1;
 const IDENTITY_HKDF_SALT: &[u8] = b"resonance:identity:seed:hkdf-salt:hkdf-sha3-256:v1";
 const ROOT_ML_DSA_SEED_LABEL: &[u8] = b"resonance:identity:root-key:seed:ml-dsa-65:v1";
 const IDENTITY_ID_LABEL: &[u8] = b"resonance:identity:public-key:id:sha3-256:v1";
-const MESSAGES_STORAGE_KEY_LABEL: &[u8] =
-    b"resonance:local-storage:messages:key:xchacha20poly1305:v1";
-const SESSIONS_STORAGE_KEY_LABEL: &[u8] =
-    b"resonance:local-storage:sessions:key:xchacha20poly1305:v1";
-const CONTACTS_STORAGE_KEY_LABEL: &[u8] =
-    b"resonance:local-storage:contacts:key:xchacha20poly1305:v1";
+const MESSAGES_STORAGE_WRAPPING_KEY_LABEL: &[u8] =
+    b"resonance:local-storage:messages-wrapping:key:xchacha20poly1305:v1";
+const SESSIONS_STORAGE_WRAPPING_KEY_LABEL: &[u8] =
+    b"resonance:local-storage:sessions-wrapping:key:xchacha20poly1305:v1";
+const CONTACTS_STORAGE_WRAPPING_KEY_LABEL: &[u8] =
+    b"resonance:local-storage:contacts-wrapping:key:xchacha20poly1305:v1";
 
 pub struct Identity {
     pub root_public_key: VerifyingKey<MlDsa65>,
@@ -71,16 +72,22 @@ pub fn public_identity(identity: &Identity) -> PublicIdentity {
     }
 }
 
-pub fn messages_storage_key_from_seed(master_seed: &MasterSeed) -> LocalStorageKey {
-    derive_seed_material::<32>(master_seed, MESSAGES_STORAGE_KEY_LABEL)
+pub fn messages_storage_wrapping_key_from_seed(
+    master_seed: &MasterSeed,
+) -> LocalStorageWrappingKey {
+    derive_seed_material::<32>(master_seed, MESSAGES_STORAGE_WRAPPING_KEY_LABEL)
 }
 
-pub fn sessions_storage_key_from_seed(master_seed: &MasterSeed) -> LocalStorageKey {
-    derive_seed_material::<32>(master_seed, SESSIONS_STORAGE_KEY_LABEL)
+pub fn sessions_storage_wrapping_key_from_seed(
+    master_seed: &MasterSeed,
+) -> LocalStorageWrappingKey {
+    derive_seed_material::<32>(master_seed, SESSIONS_STORAGE_WRAPPING_KEY_LABEL)
 }
 
-pub fn contacts_storage_key_from_seed(master_seed: &MasterSeed) -> LocalStorageKey {
-    derive_seed_material::<32>(master_seed, CONTACTS_STORAGE_KEY_LABEL)
+pub fn contacts_storage_wrapping_key_from_seed(
+    master_seed: &MasterSeed,
+) -> LocalStorageWrappingKey {
+    derive_seed_material::<32>(master_seed, CONTACTS_STORAGE_WRAPPING_KEY_LABEL)
 }
 
 fn identity_id_from_public_key(public_key: &[u8]) -> String {
@@ -94,8 +101,11 @@ fn identity_id_from_public_key(public_key: &[u8]) -> String {
 }
 
 fn derive_root_seed(master_seed: &MasterSeed) -> MlDsaSeed {
-    let root_seed = derive_seed_material::<32>(master_seed, ROOT_ML_DSA_SEED_LABEL);
-    MlDsaSeed::try_from(&root_seed[..]).expect("root ML-DSA seed is always 32 bytes")
+    let mut root_seed = derive_seed_material::<32>(master_seed, ROOT_ML_DSA_SEED_LABEL);
+    let ml_dsa_seed =
+        MlDsaSeed::try_from(&root_seed[..]).expect("root ML-DSA seed is always 32 bytes");
+    root_seed.zeroize();
+    ml_dsa_seed
 }
 
 #[cfg(test)]
@@ -108,9 +118,9 @@ mod tests {
         assert_domain_label(IDENTITY_HKDF_SALT);
         assert_domain_label(ROOT_ML_DSA_SEED_LABEL);
         assert_domain_label(IDENTITY_ID_LABEL);
-        assert_domain_label(MESSAGES_STORAGE_KEY_LABEL);
-        assert_domain_label(SESSIONS_STORAGE_KEY_LABEL);
-        assert_domain_label(CONTACTS_STORAGE_KEY_LABEL);
+        assert_domain_label(MESSAGES_STORAGE_WRAPPING_KEY_LABEL);
+        assert_domain_label(SESSIONS_STORAGE_WRAPPING_KEY_LABEL);
+        assert_domain_label(CONTACTS_STORAGE_WRAPPING_KEY_LABEL);
     }
 
     #[test]
@@ -212,30 +222,30 @@ mod tests {
     }
 
     #[test]
-    fn local_storage_keys_are_deterministic() {
+    fn local_storage_wrapping_keys_are_deterministic() {
         let seed = seed_from_mnemonic(&fixed_mnemonic());
 
         assert_eq!(
-            messages_storage_key_from_seed(&seed),
-            messages_storage_key_from_seed(&seed)
+            messages_storage_wrapping_key_from_seed(&seed),
+            messages_storage_wrapping_key_from_seed(&seed)
         );
         assert_eq!(
-            sessions_storage_key_from_seed(&seed),
-            sessions_storage_key_from_seed(&seed)
+            sessions_storage_wrapping_key_from_seed(&seed),
+            sessions_storage_wrapping_key_from_seed(&seed)
         );
         assert_eq!(
-            contacts_storage_key_from_seed(&seed),
-            contacts_storage_key_from_seed(&seed)
+            contacts_storage_wrapping_key_from_seed(&seed),
+            contacts_storage_wrapping_key_from_seed(&seed)
         );
     }
 
     #[test]
-    fn local_storage_keys_are_domain_separated() {
+    fn local_storage_wrapping_keys_are_domain_separated() {
         let seed = seed_from_mnemonic(&fixed_mnemonic());
         let root_seed = derive_seed_material::<32>(&seed, ROOT_ML_DSA_SEED_LABEL);
-        let messages_key = messages_storage_key_from_seed(&seed);
-        let sessions_key = sessions_storage_key_from_seed(&seed);
-        let contacts_key = contacts_storage_key_from_seed(&seed);
+        let messages_key = messages_storage_wrapping_key_from_seed(&seed);
+        let sessions_key = sessions_storage_wrapping_key_from_seed(&seed);
+        let contacts_key = contacts_storage_wrapping_key_from_seed(&seed);
 
         assert_ne!(messages_key, sessions_key);
         assert_ne!(messages_key, contacts_key);
@@ -246,18 +256,18 @@ mod tests {
     }
 
     #[test]
-    fn different_master_seeds_create_different_local_storage_keys() {
+    fn different_master_seeds_create_different_local_storage_wrapping_keys() {
         assert_ne!(
-            messages_storage_key_from_seed(&[1u8; 64]),
-            messages_storage_key_from_seed(&[2u8; 64])
+            messages_storage_wrapping_key_from_seed(&[1u8; 64]),
+            messages_storage_wrapping_key_from_seed(&[2u8; 64])
         );
         assert_ne!(
-            sessions_storage_key_from_seed(&[1u8; 64]),
-            sessions_storage_key_from_seed(&[2u8; 64])
+            sessions_storage_wrapping_key_from_seed(&[1u8; 64]),
+            sessions_storage_wrapping_key_from_seed(&[2u8; 64])
         );
         assert_ne!(
-            contacts_storage_key_from_seed(&[1u8; 64]),
-            contacts_storage_key_from_seed(&[2u8; 64])
+            contacts_storage_wrapping_key_from_seed(&[1u8; 64]),
+            contacts_storage_wrapping_key_from_seed(&[2u8; 64])
         );
     }
 

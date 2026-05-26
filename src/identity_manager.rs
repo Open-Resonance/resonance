@@ -17,7 +17,7 @@ pub mod password_kdf {
         pub metadata: PasswordKdfMetadata,
     }
 
-    #[derive(Deserialize, Serialize)]
+    #[derive(Clone, Copy, Deserialize, Serialize)]
     pub struct PasswordKdfMetadata {
         pub salt: [u8; PASSWORD_SALT_LEN],
         pub memory_kib: u32,
@@ -473,16 +473,20 @@ pub mod file_system {
     }
 }
 
+pub use file_system::{IdentityStorageError, ListedIdentityStorage};
+pub use vault_key::VaultKeyError;
+
 use crate::identity::MasterSeed;
 use std::{error::Error, fmt, path::Path};
+use zeroize::Zeroize;
 
 #[derive(Debug)]
 pub enum CreateIdentityStorageError {
     PasswordKdf(argon2::Error),
-    VaultKey(vault_key::VaultKeyError),
+    VaultKey(VaultKeyError),
     VaultEncryption(chacha20poly1305::Error),
     VaultSerialization(serde_json::Error),
-    Storage(file_system::IdentityStorageError),
+    Storage(IdentityStorageError),
 }
 
 pub struct DecryptedIdentityStorage {
@@ -492,34 +496,51 @@ pub struct DecryptedIdentityStorage {
 
 #[derive(Debug)]
 pub enum DecryptIdentityStorageError {
-    Storage(file_system::IdentityStorageError),
+    Storage(IdentityStorageError),
     PasswordKdf(argon2::Error),
-    VaultKey(vault_key::VaultKeyError),
+    VaultKey(VaultKeyError),
     VaultDecryption(chacha20poly1305::Error),
     VaultDeserialization(serde_json::Error),
     UnsupportedIdentityDerivationVersion(u32),
 }
 
+impl Drop for DecryptedIdentityStorage {
+    fn drop(&mut self) {
+        self.master_seed.zeroize();
+    }
+}
+
+pub fn list_identity_storage(
+    identities_dir: &Path,
+) -> Result<Vec<ListedIdentityStorage>, IdentityStorageError> {
+    file_system::list_identities(identities_dir)
+}
+
 pub fn create_identity_storage(
     identities_dir: &Path,
     local_hint: String,
-    master_seed: MasterSeed,
+    mut master_seed: MasterSeed,
     password: &str,
 ) -> Result<String, CreateIdentityStorageError> {
     let identity_vault = vault::IdentityVault::from_master_seed(master_seed);
+    master_seed.zeroize();
     let vault_plaintext = identity_vault.to_plaintext()?;
+    drop(identity_vault);
 
     let vault_key = vault_key::create_vault_key();
     let vault_ciphertext = vault::encrypt_vault(&vault_plaintext, &vault_key)?;
+    drop(vault_plaintext);
 
     let password_key = password_kdf::create_password_key(password)?;
     let wrapped_vault_key = vault_key::wrap_vault_key(&vault_key, &password_key)?;
+    drop(vault_key);
 
     let identity_record = file_system::IdentityRecord {
         local_hint,
         password_kdf: password_key.metadata,
         wrapped_vault_key,
     };
+    drop(password_key);
 
     Ok(file_system::add_identity(
         identities_dir,
@@ -538,8 +559,11 @@ pub fn decrypt_identity_storage(
         password_kdf::recreate_password_key(password, &retrieved.identity_record.password_kdf)?;
     let vault_key =
         vault_key::unwrap_vault_key(&retrieved.identity_record.wrapped_vault_key, &password_key)?;
+    drop(password_key);
     let vault_plaintext = vault::decrypt_vault(&retrieved.vault_ciphertext, &vault_key)?;
+    drop(vault_key);
     let identity_vault = vault::IdentityVault::from_plaintext(&vault_plaintext)?;
+    drop(vault_plaintext);
 
     if identity_vault.identity_derivation_version != crate::identity::IDENTITY_DERIVATION_VERSION {
         return Err(
@@ -549,9 +573,12 @@ pub fn decrypt_identity_storage(
         );
     }
 
+    let master_seed = identity_vault.master_seed;
+    drop(identity_vault);
+
     Ok(DecryptedIdentityStorage {
         local_hint: retrieved.identity_record.local_hint,
-        master_seed: identity_vault.master_seed,
+        master_seed,
     })
 }
 
@@ -608,8 +635,8 @@ impl From<argon2::Error> for CreateIdentityStorageError {
     }
 }
 
-impl From<vault_key::VaultKeyError> for CreateIdentityStorageError {
-    fn from(err: vault_key::VaultKeyError) -> Self {
+impl From<VaultKeyError> for CreateIdentityStorageError {
+    fn from(err: VaultKeyError) -> Self {
         Self::VaultKey(err)
     }
 }
@@ -626,14 +653,14 @@ impl From<serde_json::Error> for CreateIdentityStorageError {
     }
 }
 
-impl From<file_system::IdentityStorageError> for CreateIdentityStorageError {
-    fn from(err: file_system::IdentityStorageError) -> Self {
+impl From<IdentityStorageError> for CreateIdentityStorageError {
+    fn from(err: IdentityStorageError) -> Self {
         Self::Storage(err)
     }
 }
 
-impl From<file_system::IdentityStorageError> for DecryptIdentityStorageError {
-    fn from(err: file_system::IdentityStorageError) -> Self {
+impl From<IdentityStorageError> for DecryptIdentityStorageError {
+    fn from(err: IdentityStorageError) -> Self {
         Self::Storage(err)
     }
 }
@@ -644,8 +671,8 @@ impl From<argon2::Error> for DecryptIdentityStorageError {
     }
 }
 
-impl From<vault_key::VaultKeyError> for DecryptIdentityStorageError {
-    fn from(err: vault_key::VaultKeyError) -> Self {
+impl From<VaultKeyError> for DecryptIdentityStorageError {
+    fn from(err: VaultKeyError) -> Self {
         Self::VaultKey(err)
     }
 }
@@ -666,7 +693,7 @@ impl From<serde_json::Error> for DecryptIdentityStorageError {
 mod tests {
     use super::{
         DecryptIdentityStorageError, create_identity_storage, decrypt_identity_storage,
-        file_system, password_kdf, vault, vault_key,
+        file_system, list_identity_storage, password_kdf, vault, vault_key,
     };
     use std::fs;
 
@@ -838,8 +865,7 @@ mod tests {
             ))
             .join("identities");
 
-        let listed =
-            file_system::list_identities(&identities_dir).expect("missing dir should list");
+        let listed = list_identity_storage(&identities_dir).expect("missing dir should list");
 
         assert!(listed.is_empty());
     }
@@ -864,7 +890,7 @@ mod tests {
         fs::remove_file(identities_dir.join(&first_id).join("vault.enc"))
             .expect("vault should be removable to prove list does not read it");
 
-        let listed = file_system::list_identities(&identities_dir).expect("identities should list");
+        let listed = list_identity_storage(&identities_dir).expect("identities should list");
 
         assert_eq!(listed.len(), 2);
         assert_eq!(
