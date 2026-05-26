@@ -1,10 +1,10 @@
-
-// Manages Argon2id key derivation function  
+// Manages Argon2id key derivation function
 pub mod password_kdf {
     use argon2::{
-        password_hash::rand_core::{OsRng, RngCore},
         Algorithm, Argon2, Params, Version,
+        password_hash::rand_core::{OsRng, RngCore},
     };
+    use serde::Serialize;
 
     const PASSWORD_KEY_LEN: usize = 32;
     const PASSWORD_SALT_LEN: usize = 16;
@@ -17,6 +17,7 @@ pub mod password_kdf {
         pub metadata: PasswordKdfMetadata,
     }
 
+    #[derive(Serialize)]
     pub struct PasswordKdfMetadata {
         pub salt: [u8; PASSWORD_SALT_LEN],
         pub memory_kib: u32,
@@ -96,9 +97,10 @@ pub mod vault_key {
     use super::password_kdf::PasswordKey;
     use argon2::password_hash::rand_core::{OsRng, RngCore};
     use chacha20poly1305::{
-        aead::{Aead, KeyInit},
         Key, XChaCha20Poly1305, XNonce,
+        aead::{Aead, KeyInit},
     };
+    use serde::Serialize;
     use std::{error::Error, fmt};
 
     const VAULT_KEY_LEN: usize = 32;
@@ -108,6 +110,7 @@ pub mod vault_key {
         key: [u8; VAULT_KEY_LEN],
     }
 
+    #[derive(Serialize)]
     pub struct WrappedVaultKey {
         pub nonce: [u8; VAULT_KEY_WRAP_NONCE_LEN],
         pub ciphertext: Vec<u8>,
@@ -140,7 +143,8 @@ pub mod vault_key {
         OsRng.fill_bytes(&mut nonce);
 
         let cipher = cipher_from_password_key(password_key);
-        let ciphertext = cipher.encrypt(XNonce::from_slice(&nonce), vault_key.as_bytes().as_slice())?;
+        let ciphertext =
+            cipher.encrypt(XNonce::from_slice(&nonce), vault_key.as_bytes().as_slice())?;
 
         Ok(WrappedVaultKey { nonce, ciphertext })
     }
@@ -189,11 +193,13 @@ pub mod vault_key {
 // Manages the encryption and decryption of the vault
 pub mod vault {
     use super::vault_key::VaultKey;
+    use crate::identity::{IDENTITY_DERIVATION_VERSION, MasterSeed};
     use argon2::password_hash::rand_core::{OsRng, RngCore};
     use chacha20poly1305::{
-        aead::{Aead, KeyInit},
         Key, XChaCha20Poly1305, XNonce,
+        aead::{Aead, KeyInit},
     };
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
     const VAULT_NONCE_LEN: usize = 24;
 
@@ -201,9 +207,36 @@ pub mod vault {
         pub data: Vec<u8>,
     }
 
+    #[derive(Deserialize, Serialize)]
+    pub struct IdentityVault {
+        pub identity_derivation_version: u32,
+        #[serde(with = "master_seed_serde")]
+        pub master_seed: MasterSeed,
+    }
+
+    #[derive(Serialize)]
     pub struct VaultCiphertext {
         pub nonce: [u8; VAULT_NONCE_LEN],
         pub ciphertext: Vec<u8>,
+    }
+
+    impl IdentityVault {
+        pub fn from_master_seed(master_seed: MasterSeed) -> Self {
+            Self {
+                identity_derivation_version: IDENTITY_DERIVATION_VERSION,
+                master_seed,
+            }
+        }
+
+        pub fn to_plaintext(&self) -> Result<VaultPlaintext, serde_json::Error> {
+            Ok(VaultPlaintext {
+                data: serde_json::to_vec(self)?,
+            })
+        }
+
+        pub fn from_plaintext(plaintext: &VaultPlaintext) -> Result<Self, serde_json::Error> {
+            serde_json::from_slice(&plaintext.data)
+        }
     }
 
     pub fn encrypt_vault(
@@ -235,6 +268,228 @@ pub mod vault {
     fn cipher_from_vault_key(vault_key: &VaultKey) -> XChaCha20Poly1305 {
         XChaCha20Poly1305::new(Key::from_slice(vault_key.as_bytes()))
     }
+
+    mod master_seed_serde {
+        use super::*;
+
+        pub fn serialize<S>(master_seed: &MasterSeed, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.serialize_str(&hex::encode(master_seed))
+        }
+
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<MasterSeed, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let encoded = String::deserialize(deserializer)?;
+            let decoded = hex::decode(encoded).map_err(de::Error::custom)?;
+
+            decoded
+                .try_into()
+                .map_err(|decoded: Vec<u8>| de::Error::invalid_length(decoded.len(), &"64 bytes"))
+        }
+    }
+}
+
+// Manages creation and handling of the file system
+pub mod file_system {
+    use super::{
+        password_kdf::PasswordKdfMetadata, vault::VaultCiphertext, vault_key::WrappedVaultKey,
+    };
+    use argon2::password_hash::rand_core::{OsRng, RngCore};
+    use serde::Serialize;
+    use std::{
+        error::Error,
+        fmt, fs, io,
+        path::{Path, PathBuf},
+    };
+
+    const LOCAL_ID_LEN: usize = 16;
+    const MAX_LOCAL_ID_ATTEMPTS: usize = 16;
+    const IDENTITY_RECORD_FILE: &str = "identity_record.json";
+    const VAULT_FILE: &str = "vault.enc";
+
+    #[derive(Serialize)]
+    pub struct IdentityRecord {
+        pub local_hint: String,
+        pub password_kdf: PasswordKdfMetadata,
+        pub wrapped_vault_key: WrappedVaultKey,
+    }
+
+    #[derive(Debug)]
+    pub enum IdentityStorageError {
+        Io(io::Error),
+        Json(serde_json::Error),
+        LocalIdCollision,
+    }
+
+    pub fn generate_random_id() -> String {
+        let mut id = [0u8; LOCAL_ID_LEN];
+        OsRng.fill_bytes(&mut id);
+        hex::encode(id)
+    }
+
+    pub fn add_identity(
+        identities_dir: &Path,
+        identity_record: &IdentityRecord,
+        vault_ciphertext: &VaultCiphertext,
+    ) -> Result<String, IdentityStorageError> {
+        fs::create_dir_all(identities_dir)?;
+
+        let (local_id, identity_dir) = create_identity_dir(identities_dir)?;
+
+        let identity_record_path = identity_dir.join(IDENTITY_RECORD_FILE);
+        let vault_path = identity_dir.join(VAULT_FILE);
+
+        fs::write(
+            identity_record_path,
+            serde_json::to_vec_pretty(identity_record)?,
+        )?;
+        fs::write(vault_path, serde_json::to_vec(vault_ciphertext)?)?;
+
+        Ok(local_id)
+    }
+
+    impl fmt::Display for IdentityStorageError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                IdentityStorageError::Io(err) => write!(f, "identity storage IO failed: {err}"),
+                IdentityStorageError::Json(err) => {
+                    write!(f, "identity storage serialization failed: {err}")
+                }
+                IdentityStorageError::LocalIdCollision => {
+                    write!(f, "could not create a unique local identity ID")
+                }
+            }
+        }
+    }
+
+    impl Error for IdentityStorageError {}
+
+    impl From<io::Error> for IdentityStorageError {
+        fn from(err: io::Error) -> Self {
+            Self::Io(err)
+        }
+    }
+
+    impl From<serde_json::Error> for IdentityStorageError {
+        fn from(err: serde_json::Error) -> Self {
+            Self::Json(err)
+        }
+    }
+
+    fn create_identity_dir(
+        identities_dir: &Path,
+    ) -> Result<(String, PathBuf), IdentityStorageError> {
+        for _ in 0..MAX_LOCAL_ID_ATTEMPTS {
+            let local_id = generate_random_id();
+            let identity_dir = identity_path(identities_dir, &local_id);
+
+            match fs::create_dir(&identity_dir) {
+                Ok(()) => return Ok((local_id, identity_dir)),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Err(IdentityStorageError::LocalIdCollision)
+    }
+
+    fn identity_path(identities_dir: &Path, local_id: &str) -> PathBuf {
+        identities_dir.join(local_id)
+    }
+}
+
+use crate::identity::MasterSeed;
+use std::{error::Error, fmt, path::Path};
+
+#[derive(Debug)]
+pub enum CreateIdentityStorageError {
+    PasswordKdf(argon2::Error),
+    VaultKey(vault_key::VaultKeyError),
+    VaultEncryption(chacha20poly1305::Error),
+    VaultSerialization(serde_json::Error),
+    Storage(file_system::IdentityStorageError),
+}
+
+pub fn create_identity_storage(
+    identities_dir: &Path,
+    local_hint: String,
+    master_seed: MasterSeed,
+    password: &str,
+) -> Result<String, CreateIdentityStorageError> {
+    let identity_vault = vault::IdentityVault::from_master_seed(master_seed);
+    let vault_plaintext = identity_vault.to_plaintext()?;
+
+    let vault_key = vault_key::create_vault_key();
+    let vault_ciphertext = vault::encrypt_vault(&vault_plaintext, &vault_key)?;
+
+    let password_key = password_kdf::create_password_key(password)?;
+    let wrapped_vault_key = vault_key::wrap_vault_key(&vault_key, &password_key)?;
+
+    let identity_record = file_system::IdentityRecord {
+        local_hint,
+        password_kdf: password_key.metadata,
+        wrapped_vault_key,
+    };
+
+    Ok(file_system::add_identity(
+        identities_dir,
+        &identity_record,
+        &vault_ciphertext,
+    )?)
+}
+
+impl fmt::Display for CreateIdentityStorageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CreateIdentityStorageError::PasswordKdf(err) => {
+                write!(f, "password key creation failed: {err}")
+            }
+            CreateIdentityStorageError::VaultKey(err) => {
+                write!(f, "vault key wrapping failed: {err}")
+            }
+            CreateIdentityStorageError::VaultEncryption(_) => write!(f, "vault encryption failed"),
+            CreateIdentityStorageError::VaultSerialization(err) => {
+                write!(f, "vault serialization failed: {err}")
+            }
+            CreateIdentityStorageError::Storage(err) => write!(f, "identity storage failed: {err}"),
+        }
+    }
+}
+
+impl Error for CreateIdentityStorageError {}
+
+impl From<argon2::Error> for CreateIdentityStorageError {
+    fn from(err: argon2::Error) -> Self {
+        Self::PasswordKdf(err)
+    }
+}
+
+impl From<vault_key::VaultKeyError> for CreateIdentityStorageError {
+    fn from(err: vault_key::VaultKeyError) -> Self {
+        Self::VaultKey(err)
+    }
+}
+
+impl From<chacha20poly1305::Error> for CreateIdentityStorageError {
+    fn from(err: chacha20poly1305::Error) -> Self {
+        Self::VaultEncryption(err)
+    }
+}
+
+impl From<serde_json::Error> for CreateIdentityStorageError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::VaultSerialization(err)
+    }
+}
+
+impl From<file_system::IdentityStorageError> for CreateIdentityStorageError {
+    fn from(err: file_system::IdentityStorageError) -> Self {
+        Self::Storage(err)
+    }
 }
 
 
@@ -242,18 +497,17 @@ pub mod vault {
 
 #[cfg(test)]
 mod tests {
-    use super::{password_kdf, vault, vault_key};
+    use super::{create_identity_storage, file_system, password_kdf, vault, vault_key};
+    use std::fs;
 
     #[test]
     fn recreate_password_key_recreates_the_same_key() {
         let created = password_kdf::create_password_key("correct horse battery staple")
             .expect("password key should be created");
 
-        let recreated = password_kdf::recreate_password_key(
-            "correct horse battery staple",
-            &created.metadata,
-        )
-        .expect("password key should be recreated");
+        let recreated =
+            password_kdf::recreate_password_key("correct horse battery staple", &created.metadata)
+                .expect("password key should be recreated");
 
         assert_eq!(created.as_bytes(), recreated.as_bytes());
         assert_eq!(created.metadata.salt, recreated.metadata.salt);
@@ -281,10 +535,10 @@ mod tests {
             .expect("password key should be created");
         let vault_key = vault_key::create_vault_key();
 
-        let wrapped = vault_key::wrap_vault_key(&vault_key, &password_key)
-            .expect("vault key should wrap");
-        let unwrapped = vault_key::unwrap_vault_key(&wrapped, &password_key)
-            .expect("vault key should unwrap");
+        let wrapped =
+            vault_key::wrap_vault_key(&vault_key, &password_key).expect("vault key should wrap");
+        let unwrapped =
+            vault_key::unwrap_vault_key(&wrapped, &password_key).expect("vault key should unwrap");
 
         assert_eq!(vault_key.as_bytes(), unwrapped.as_bytes());
         assert_ne!(wrapped.nonce, [0u8; 24]);
@@ -298,8 +552,8 @@ mod tests {
         let wrong_password_key = password_kdf::create_password_key("wrong horse battery staple")
             .expect("password key should be created");
         let vault_key = vault_key::create_vault_key();
-        let wrapped = vault_key::wrap_vault_key(&vault_key, &password_key)
-            .expect("vault key should wrap");
+        let wrapped =
+            vault_key::wrap_vault_key(&vault_key, &password_key).expect("vault key should wrap");
 
         let err = match vault_key::unwrap_vault_key(&wrapped, &wrong_password_key) {
             Ok(_) => panic!("wrong password key should fail authentication"),
@@ -354,5 +608,147 @@ mod tests {
         let result = vault::decrypt_vault(&ciphertext, &vault_key);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn identity_vault_serializes_master_seed_and_derivation_version() {
+        let master_seed = [42u8; 64];
+        let identity_vault = vault::IdentityVault::from_master_seed(master_seed);
+
+        let plaintext = identity_vault
+            .to_plaintext()
+            .expect("identity vault should serialize");
+        let restored = vault::IdentityVault::from_plaintext(&plaintext)
+            .expect("identity vault should deserialize");
+
+        assert_eq!(
+            restored.identity_derivation_version,
+            crate::identity::IDENTITY_DERIVATION_VERSION
+        );
+        assert_eq!(restored.master_seed, master_seed);
+    }
+
+    #[test]
+    fn identity_vault_round_trips_through_vault_encryption() {
+        let vault_key = vault_key::create_vault_key();
+        let master_seed = [7u8; 64];
+        let identity_vault = vault::IdentityVault::from_master_seed(master_seed);
+        let plaintext = identity_vault
+            .to_plaintext()
+            .expect("identity vault should serialize");
+
+        let ciphertext =
+            vault::encrypt_vault(&plaintext, &vault_key).expect("identity vault should encrypt");
+        let decrypted =
+            vault::decrypt_vault(&ciphertext, &vault_key).expect("identity vault should decrypt");
+        let restored = vault::IdentityVault::from_plaintext(&decrypted)
+            .expect("identity vault should deserialize");
+
+        assert_eq!(
+            restored.identity_derivation_version,
+            crate::identity::IDENTITY_DERIVATION_VERSION
+        );
+        assert_eq!(restored.master_seed, master_seed);
+    }
+
+    #[test]
+    fn generate_random_id_returns_hex_local_storage_id() {
+        let id = file_system::generate_random_id();
+
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn add_identity_creates_identity_folder_and_files() {
+        let test_root = std::env::temp_dir().join(format!(
+            "resonance-identity-manager-test-{}",
+            file_system::generate_random_id()
+        ));
+        let identities_dir = test_root.join("identities");
+
+        let password_key = password_kdf::create_password_key("correct horse battery staple")
+            .expect("password key should be created");
+        let vault_key = vault_key::create_vault_key();
+        let wrapped_vault_key =
+            vault_key::wrap_vault_key(&vault_key, &password_key).expect("vault key should wrap");
+        let identity_record = file_system::IdentityRecord {
+            local_hint: "Personal".to_string(),
+            password_kdf: password_key.metadata,
+            wrapped_vault_key,
+        };
+        let vault_ciphertext = vault::encrypt_vault(
+            &vault::VaultPlaintext {
+                data: b"encrypted vault payload".to_vec(),
+            },
+            &vault_key,
+        )
+        .expect("vault should encrypt");
+
+        let local_id =
+            file_system::add_identity(&identities_dir, &identity_record, &vault_ciphertext)
+                .expect("identity should be added");
+
+        let identity_dir = identities_dir.join(&local_id);
+        let identity_record_file = identity_dir.join("identity_record.json");
+        let vault_file = identity_dir.join("vault.enc");
+
+        assert_eq!(local_id.len(), 32);
+        assert!(identity_dir.is_dir());
+        assert!(identity_record_file.is_file());
+        assert!(vault_file.is_file());
+
+        let identity_record_json: serde_json::Value = serde_json::from_slice(
+            &fs::read(identity_record_file).expect("identity record should be readable"),
+        )
+        .expect("identity record should be JSON");
+        let vault_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(vault_file).expect("vault should be readable"))
+                .expect("vault should be JSON");
+
+        assert_eq!(identity_record_json["local_hint"], "Personal");
+        assert!(identity_record_json.get("password_kdf").is_some());
+        assert!(identity_record_json.get("wrapped_vault_key").is_some());
+        assert!(vault_json.get("nonce").is_some());
+        assert!(vault_json.get("ciphertext").is_some());
+
+        fs::remove_dir_all(test_root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn create_identity_storage_creates_complete_local_storage() {
+        let test_root = std::env::temp_dir().join(format!(
+            "resonance-create-identity-storage-test-{}",
+            file_system::generate_random_id()
+        ));
+        let identities_dir = test_root.join("identities");
+
+        let local_id = create_identity_storage(
+            &identities_dir,
+            "Work".to_string(),
+            [9u8; 64],
+            "correct horse battery staple",
+        )
+        .expect("identity storage should be created");
+
+        let identity_dir = identities_dir.join(&local_id);
+        let identity_record_file = identity_dir.join("identity_record.json");
+        let vault_file = identity_dir.join("vault.enc");
+
+        assert_eq!(local_id.len(), 32);
+        assert!(identity_dir.is_dir());
+        assert!(identity_record_file.is_file());
+        assert!(vault_file.is_file());
+
+        let identity_record_json: serde_json::Value = serde_json::from_slice(
+            &fs::read(identity_record_file).expect("identity record should be readable"),
+        )
+        .expect("identity record should be JSON");
+
+        assert_eq!(identity_record_json["local_hint"], "Work");
+        assert!(identity_record_json.get("password_kdf").is_some());
+        assert!(identity_record_json.get("wrapped_vault_key").is_some());
+
+        fs::remove_dir_all(test_root).expect("test directory should be removed");
     }
 }
