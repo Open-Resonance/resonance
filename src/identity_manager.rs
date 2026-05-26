@@ -4,7 +4,7 @@ pub mod password_kdf {
         Algorithm, Argon2, Params, Version,
         password_hash::rand_core::{OsRng, RngCore},
     };
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
 
     const PASSWORD_KEY_LEN: usize = 32;
     const PASSWORD_SALT_LEN: usize = 16;
@@ -17,7 +17,7 @@ pub mod password_kdf {
         pub metadata: PasswordKdfMetadata,
     }
 
-    #[derive(Serialize)]
+    #[derive(Deserialize, Serialize)]
     pub struct PasswordKdfMetadata {
         pub salt: [u8; PASSWORD_SALT_LEN],
         pub memory_kib: u32,
@@ -100,7 +100,7 @@ pub mod vault_key {
         Key, XChaCha20Poly1305, XNonce,
         aead::{Aead, KeyInit},
     };
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
     use std::{error::Error, fmt};
 
     const VAULT_KEY_LEN: usize = 32;
@@ -110,7 +110,7 @@ pub mod vault_key {
         key: [u8; VAULT_KEY_LEN],
     }
 
-    #[derive(Serialize)]
+    #[derive(Deserialize, Serialize)]
     pub struct WrappedVaultKey {
         pub nonce: [u8; VAULT_KEY_WRAP_NONCE_LEN],
         pub ciphertext: Vec<u8>,
@@ -214,7 +214,7 @@ pub mod vault {
         pub master_seed: MasterSeed,
     }
 
-    #[derive(Serialize)]
+    #[derive(Deserialize, Serialize)]
     pub struct VaultCiphertext {
         pub nonce: [u8; VAULT_NONCE_LEN],
         pub ciphertext: Vec<u8>,
@@ -299,7 +299,7 @@ pub mod file_system {
         password_kdf::PasswordKdfMetadata, vault::VaultCiphertext, vault_key::WrappedVaultKey,
     };
     use argon2::password_hash::rand_core::{OsRng, RngCore};
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
     use std::{
         error::Error,
         fmt, fs, io,
@@ -311,11 +311,22 @@ pub mod file_system {
     const IDENTITY_RECORD_FILE: &str = "identity_record.json";
     const VAULT_FILE: &str = "vault.enc";
 
-    #[derive(Serialize)]
+    #[derive(Deserialize, Serialize)]
     pub struct IdentityRecord {
         pub local_hint: String,
         pub password_kdf: PasswordKdfMetadata,
         pub wrapped_vault_key: WrappedVaultKey,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct ListedIdentityStorage {
+        pub local_id: String,
+        pub local_hint: String,
+    }
+
+    pub struct RetrievedIdentityStorage {
+        pub identity_record: IdentityRecord,
+        pub vault_ciphertext: VaultCiphertext,
     }
 
     #[derive(Debug)]
@@ -350,6 +361,52 @@ pub mod file_system {
         fs::write(vault_path, serde_json::to_vec(vault_ciphertext)?)?;
 
         Ok(local_id)
+    }
+
+    pub fn list_identities(
+        identities_dir: &Path,
+    ) -> Result<Vec<ListedIdentityStorage>, IdentityStorageError> {
+        if !identities_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut identities = Vec::new();
+
+        for entry in fs::read_dir(identities_dir)? {
+            let entry = entry?;
+
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let local_id = entry.file_name().to_string_lossy().into_owned();
+            let identity_record = read_identity_record(&entry.path())?;
+
+            identities.push(ListedIdentityStorage {
+                local_id,
+                local_hint: identity_record.local_hint,
+            });
+        }
+
+        identities.sort_by(|left, right| {
+            left.local_hint
+                .cmp(&right.local_hint)
+                .then(left.local_id.cmp(&right.local_id))
+        });
+
+        Ok(identities)
+    }
+
+    pub fn retrieve_identity(
+        identities_dir: &Path,
+        local_id: &str,
+    ) -> Result<RetrievedIdentityStorage, IdentityStorageError> {
+        let identity_dir = identity_path(identities_dir, local_id);
+
+        Ok(RetrievedIdentityStorage {
+            identity_record: read_identity_record(&identity_dir)?,
+            vault_ciphertext: read_vault_ciphertext(&identity_dir)?,
+        })
     }
 
     impl fmt::Display for IdentityStorageError {
@@ -400,6 +457,20 @@ pub mod file_system {
     fn identity_path(identities_dir: &Path, local_id: &str) -> PathBuf {
         identities_dir.join(local_id)
     }
+
+    fn read_identity_record(identity_dir: &Path) -> Result<IdentityRecord, IdentityStorageError> {
+        let identity_record_path = identity_dir.join(IDENTITY_RECORD_FILE);
+        let identity_record = fs::read(identity_record_path)?;
+
+        Ok(serde_json::from_slice(&identity_record)?)
+    }
+
+    fn read_vault_ciphertext(identity_dir: &Path) -> Result<VaultCiphertext, IdentityStorageError> {
+        let vault_path = identity_dir.join(VAULT_FILE);
+        let vault_ciphertext = fs::read(vault_path)?;
+
+        Ok(serde_json::from_slice(&vault_ciphertext)?)
+    }
 }
 
 use crate::identity::MasterSeed;
@@ -412,6 +483,21 @@ pub enum CreateIdentityStorageError {
     VaultEncryption(chacha20poly1305::Error),
     VaultSerialization(serde_json::Error),
     Storage(file_system::IdentityStorageError),
+}
+
+pub struct DecryptedIdentityStorage {
+    pub local_hint: String,
+    pub master_seed: MasterSeed,
+}
+
+#[derive(Debug)]
+pub enum DecryptIdentityStorageError {
+    Storage(file_system::IdentityStorageError),
+    PasswordKdf(argon2::Error),
+    VaultKey(vault_key::VaultKeyError),
+    VaultDecryption(chacha20poly1305::Error),
+    VaultDeserialization(serde_json::Error),
+    UnsupportedIdentityDerivationVersion(u32),
 }
 
 pub fn create_identity_storage(
@@ -442,6 +528,33 @@ pub fn create_identity_storage(
     )?)
 }
 
+pub fn decrypt_identity_storage(
+    identities_dir: &Path,
+    local_id: &str,
+    password: &str,
+) -> Result<DecryptedIdentityStorage, DecryptIdentityStorageError> {
+    let retrieved = file_system::retrieve_identity(identities_dir, local_id)?;
+    let password_key =
+        password_kdf::recreate_password_key(password, &retrieved.identity_record.password_kdf)?;
+    let vault_key =
+        vault_key::unwrap_vault_key(&retrieved.identity_record.wrapped_vault_key, &password_key)?;
+    let vault_plaintext = vault::decrypt_vault(&retrieved.vault_ciphertext, &vault_key)?;
+    let identity_vault = vault::IdentityVault::from_plaintext(&vault_plaintext)?;
+
+    if identity_vault.identity_derivation_version != crate::identity::IDENTITY_DERIVATION_VERSION {
+        return Err(
+            DecryptIdentityStorageError::UnsupportedIdentityDerivationVersion(
+                identity_vault.identity_derivation_version,
+            ),
+        );
+    }
+
+    Ok(DecryptedIdentityStorage {
+        local_hint: retrieved.identity_record.local_hint,
+        master_seed: identity_vault.master_seed,
+    })
+}
+
 impl fmt::Display for CreateIdentityStorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -461,6 +574,33 @@ impl fmt::Display for CreateIdentityStorageError {
 }
 
 impl Error for CreateIdentityStorageError {}
+
+impl fmt::Display for DecryptIdentityStorageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecryptIdentityStorageError::Storage(err) => {
+                write!(f, "identity storage retrieval failed: {err}")
+            }
+            DecryptIdentityStorageError::PasswordKdf(err) => {
+                write!(f, "password key recreation failed: {err}")
+            }
+            DecryptIdentityStorageError::VaultKey(err) => {
+                write!(f, "vault key unwrapping failed: {err}")
+            }
+            DecryptIdentityStorageError::VaultDecryption(_) => {
+                write!(f, "vault decryption failed")
+            }
+            DecryptIdentityStorageError::VaultDeserialization(err) => {
+                write!(f, "vault deserialization failed: {err}")
+            }
+            DecryptIdentityStorageError::UnsupportedIdentityDerivationVersion(version) => {
+                write!(f, "unsupported identity derivation version: {version}")
+            }
+        }
+    }
+}
+
+impl Error for DecryptIdentityStorageError {}
 
 impl From<argon2::Error> for CreateIdentityStorageError {
     fn from(err: argon2::Error) -> Self {
@@ -492,12 +632,42 @@ impl From<file_system::IdentityStorageError> for CreateIdentityStorageError {
     }
 }
 
+impl From<file_system::IdentityStorageError> for DecryptIdentityStorageError {
+    fn from(err: file_system::IdentityStorageError) -> Self {
+        Self::Storage(err)
+    }
+}
 
+impl From<argon2::Error> for DecryptIdentityStorageError {
+    fn from(err: argon2::Error) -> Self {
+        Self::PasswordKdf(err)
+    }
+}
 
+impl From<vault_key::VaultKeyError> for DecryptIdentityStorageError {
+    fn from(err: vault_key::VaultKeyError) -> Self {
+        Self::VaultKey(err)
+    }
+}
+
+impl From<chacha20poly1305::Error> for DecryptIdentityStorageError {
+    fn from(err: chacha20poly1305::Error) -> Self {
+        Self::VaultDecryption(err)
+    }
+}
+
+impl From<serde_json::Error> for DecryptIdentityStorageError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::VaultDeserialization(err)
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use super::{create_identity_storage, file_system, password_kdf, vault, vault_key};
+    use super::{
+        DecryptIdentityStorageError, create_identity_storage, decrypt_identity_storage,
+        file_system, password_kdf, vault, vault_key,
+    };
     use std::fs;
 
     #[test]
@@ -660,6 +830,91 @@ mod tests {
     }
 
     #[test]
+    fn list_identities_returns_empty_list_when_identities_dir_does_not_exist() {
+        let identities_dir = std::env::temp_dir()
+            .join(format!(
+                "resonance-missing-identities-test-{}",
+                file_system::generate_random_id()
+            ))
+            .join("identities");
+
+        let listed =
+            file_system::list_identities(&identities_dir).expect("missing dir should list");
+
+        assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn list_identities_returns_local_ids_and_hints() {
+        let test_root = std::env::temp_dir().join(format!(
+            "resonance-list-identities-test-{}",
+            file_system::generate_random_id()
+        ));
+        let identities_dir = test_root.join("identities");
+        let first_record = test_identity_record("Work");
+        let second_record = test_identity_record("Personal");
+        let vault_ciphertext = test_vault_ciphertext();
+
+        let first_id = file_system::add_identity(&identities_dir, &first_record, &vault_ciphertext)
+            .expect("first identity should be added");
+        let second_id =
+            file_system::add_identity(&identities_dir, &second_record, &vault_ciphertext)
+                .expect("second identity should be added");
+
+        fs::remove_file(identities_dir.join(&first_id).join("vault.enc"))
+            .expect("vault should be removable to prove list does not read it");
+
+        let listed = file_system::list_identities(&identities_dir).expect("identities should list");
+
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed,
+            vec![
+                file_system::ListedIdentityStorage {
+                    local_id: second_id,
+                    local_hint: "Personal".to_string(),
+                },
+                file_system::ListedIdentityStorage {
+                    local_id: first_id,
+                    local_hint: "Work".to_string(),
+                },
+            ]
+        );
+
+        fs::remove_dir_all(test_root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn retrieve_identity_returns_identity_record_and_vault_ciphertext() {
+        let test_root = std::env::temp_dir().join(format!(
+            "resonance-retrieve-identity-test-{}",
+            file_system::generate_random_id()
+        ));
+        let identities_dir = test_root.join("identities");
+        let identity_record = test_identity_record("Personal");
+        let vault_ciphertext = test_vault_ciphertext();
+
+        let local_id =
+            file_system::add_identity(&identities_dir, &identity_record, &vault_ciphertext)
+                .expect("identity should be added");
+
+        let retrieved = file_system::retrieve_identity(&identities_dir, &local_id)
+            .expect("identity should be retrieved");
+
+        assert_eq!(retrieved.identity_record.local_hint, "Personal");
+        assert_eq!(retrieved.identity_record.password_kdf.salt, [1u8; 16]);
+        assert_eq!(retrieved.identity_record.wrapped_vault_key.nonce, [2u8; 24]);
+        assert_eq!(
+            retrieved.identity_record.wrapped_vault_key.ciphertext,
+            vec![3, 4, 5]
+        );
+        assert_eq!(retrieved.vault_ciphertext.nonce, [6u8; 24]);
+        assert_eq!(retrieved.vault_ciphertext.ciphertext, vec![7, 8, 9]);
+
+        fs::remove_dir_all(test_root).expect("test directory should be removed");
+    }
+
+    #[test]
     fn add_identity_creates_identity_folder_and_files() {
         let test_root = std::env::temp_dir().join(format!(
             "resonance-identity-manager-test-{}",
@@ -750,5 +1005,79 @@ mod tests {
         assert!(identity_record_json.get("wrapped_vault_key").is_some());
 
         fs::remove_dir_all(test_root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn decrypt_identity_storage_returns_hint_and_master_seed() {
+        let test_root = std::env::temp_dir().join(format!(
+            "resonance-decrypt-identity-storage-test-{}",
+            file_system::generate_random_id()
+        ));
+        let identities_dir = test_root.join("identities");
+        let master_seed = [11u8; 64];
+        let local_id = create_identity_storage(
+            &identities_dir,
+            "Personal".to_string(),
+            master_seed,
+            "correct horse battery staple",
+        )
+        .expect("identity storage should be created");
+
+        let decrypted =
+            decrypt_identity_storage(&identities_dir, &local_id, "correct horse battery staple")
+                .expect("identity storage should decrypt");
+
+        assert_eq!(decrypted.local_hint, "Personal");
+        assert_eq!(decrypted.master_seed, master_seed);
+
+        fs::remove_dir_all(test_root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn decrypt_identity_storage_rejects_wrong_password() {
+        let test_root = std::env::temp_dir().join(format!(
+            "resonance-decrypt-wrong-password-test-{}",
+            file_system::generate_random_id()
+        ));
+        let identities_dir = test_root.join("identities");
+        let local_id = create_identity_storage(
+            &identities_dir,
+            "Personal".to_string(),
+            [12u8; 64],
+            "correct horse battery staple",
+        )
+        .expect("identity storage should be created");
+
+        let err = match decrypt_identity_storage(&identities_dir, &local_id, "wrong password") {
+            Ok(_) => panic!("wrong password should fail decryption"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, DecryptIdentityStorageError::VaultKey(_)));
+
+        fs::remove_dir_all(test_root).expect("test directory should be removed");
+    }
+
+    fn test_identity_record(local_hint: &str) -> file_system::IdentityRecord {
+        file_system::IdentityRecord {
+            local_hint: local_hint.to_string(),
+            password_kdf: password_kdf::PasswordKdfMetadata {
+                salt: [1u8; 16],
+                memory_kib: 64 * 1024,
+                iterations: 3,
+                parallelism: 1,
+            },
+            wrapped_vault_key: vault_key::WrappedVaultKey {
+                nonce: [2u8; 24],
+                ciphertext: vec![3, 4, 5],
+            },
+        }
+    }
+
+    fn test_vault_ciphertext() -> vault::VaultCiphertext {
+        vault::VaultCiphertext {
+            nonce: [6u8; 24],
+            ciphertext: vec![7, 8, 9],
+        }
     }
 }
