@@ -1,5 +1,5 @@
 // Manages Argon2id key derivation function
-pub mod password_kdf {
+mod password_kdf {
     use argon2::{
         Algorithm, Argon2, Params, Version,
         password_hash::rand_core::{OsRng, RngCore},
@@ -93,7 +93,7 @@ pub mod password_kdf {
 }
 
 // Manages the creation, wrapping and unwrapping of the vault key
-pub mod vault_key {
+mod vault_key {
     use super::password_kdf::PasswordKey;
     use argon2::password_hash::rand_core::{OsRng, RngCore};
     use chacha20poly1305::{
@@ -191,7 +191,7 @@ pub mod vault_key {
 }
 
 // Manages the encryption and decryption of the vault
-pub mod vault {
+mod vault {
     use super::vault_key::VaultKey;
     use crate::identity::{IDENTITY_DERIVATION_VERSION, MasterSeed};
     use argon2::password_hash::rand_core::{OsRng, RngCore};
@@ -294,7 +294,7 @@ pub mod vault {
 }
 
 // Manages creation and handling of the file system
-pub mod file_system {
+mod file_system {
     use super::{
         password_kdf::PasswordKdfMetadata, vault::VaultCiphertext, vault_key::WrappedVaultKey,
     };
